@@ -1,0 +1,356 @@
+/*
+ * GABpbx -- A telephony toolkit for Linux. bip
+ *
+ * app_gabilling.c for gabpbx 1.2.1
+ * by german aracil boned german@tecnoxarxa.net
+ *
+ */
+
+#ifdef HAVE_CONFIG_H
+#include "confdefs.h"
+#endif
+
+#include "gabpbx.h"
+#include "gabpbx/module.h"
+#include "gabpbx/channel.h"
+#include "gabpbx/pbx.h"
+#include "gabpbx/lock.h"
+#include "gabpbx/app.h"
+#include "gabpbx/causes.h"
+#include "gabpbx/file.h"
+#include "gabpbx/cdr.h"
+#include "gabpbx/say.h"
+#include "gabpbx/cdr.h"
+#include "gabpbx/options.h"
+#include "gabpbx/paths.h"
+
+GABPBX_FILE_VERSION(__FILE__, "$Revision: 1000 $")
+
+static char *app = "GABBilling";
+
+#define VAR_SIZE 64
+
+static char proxyname[80];
+struct ast_app *dial_app            = NULL;
+struct ast_app *hangup_app          = NULL;
+struct ast_app *sipaddheader_app    = NULL;
+struct ast_app *sipremoveheader_app = NULL;
+struct ast_app *set_app             = NULL;
+
+static int dial(struct ast_channel *chan, void *data)
+{
+	int ret;
+
+	if (dial_app) {
+		ret = pbx_exec(chan, dial_app, data);
+	} else {
+		ast_log(LOG_WARNING, "Could not find application Dial\n");
+		ret = -2;
+	}
+
+	return ret;
+}
+
+/*
+static int hangup(struct ast_channel *chan, void *data)
+{
+        int ret;
+
+        if (hangup_app) {
+                ret = pbx_exec(chan, hangup_app, data);
+        } else {
+                ast_log(LOG_WARNING, "Could not find application hangup\n");
+                ret = -2;
+        }
+
+        return ret;
+}
+*/
+
+static int SIPAddHeader(struct ast_channel *chan, void *data)
+{
+        int ret;
+
+	if (sipaddheader_app) {
+                ret = pbx_exec(chan, sipaddheader_app, data);
+        } else {
+		ast_log(LOG_WARNING, "Could not find application SIPAddHeader\n");
+		ret = -2;
+        }
+
+        return ret;
+}
+
+static int SIPRemoveHeader(struct ast_channel *chan, void *data)
+{
+        int ret;
+
+        if (sipremoveheader_app) {
+                ret = pbx_exec(chan, sipremoveheader_app, data);
+        } else {
+                ast_log(LOG_WARNING, "Could not find application SIPRemoveHeader\n");
+                ret = -2;
+        }
+
+        return ret;
+}
+
+static char *replace(const char *s, const char *old, const char *new)
+{
+        char *ds = NULL, *sr = NULL;
+        size_t i, count = 0;
+        size_t newlen = strlen(new);
+        size_t oldlen = strlen(old);
+
+        if (newlen != oldlen) {
+                for (i = 0; s[i] != '\0'; ) {
+                        if (memcmp(&s[i], old, oldlen) == 0)
+                                count++, i += oldlen;
+                        else
+                                i++;
+                }
+        } else
+                i = strlen(s);
+
+        ds = malloc(i + 1 + count * (newlen - oldlen));
+        if (ds == NULL)
+                return ds;
+
+        sr = ds;
+        while (*s) {
+                if (memcmp(s, old, oldlen) == 0) {
+                        memcpy(sr, new, newlen);
+                        sr += newlen;
+                        s += oldlen;
+                } else
+                        *sr++ = *s++;
+        }
+        *sr = '\0';
+
+        return ds;
+}
+
+static char *rep_quotation(const char *s)
+{
+        char *ret1, *ret2;
+
+        if (s == NULL)
+                return NULL;
+
+        ret1 = replace(s, "'", "\\'");
+        ret2 = replace(ret1, "\"", "\\""\"""");
+        free(ret1);
+        return ret2;
+}
+
+static int gabilling_exec(struct ast_channel *chan, const char *data)
+{
+        char *options			= NULL;
+        char *timeout			= NULL;
+	char *url			= NULL;
+	char *dst			= NULL;
+        char *cidnum                    = NULL;
+	char *cidname                   = NULL;
+	char tech[AST_MAX_EXTENSION]	= "";
+	char *tmp			= NULL;
+	const char *faxuid;
+
+        AST_DECLARE_APP_ARGS(args,
+		AST_APP_ARG(dst);
+		AST_APP_ARG(timeout);
+                AST_APP_ARG(options);
+		AST_APP_ARG(url);
+        );
+
+        if (!ast_strlen_zero(data)) {
+                tmp = ast_strdupa(data);
+                AST_STANDARD_APP_ARGS(args, tmp);
+                if (args.dst)
+			dst = args.dst;
+		else
+			return 0;
+		if (args.timeout)
+			timeout = args.timeout;
+		if (args.options)
+			options = args.options;
+		if (args.url)
+			url = args.url;
+	}
+
+        if (ast_strlen_zero(dst)) {
+		ast_log(LOG_ERROR, "Gabilling requires a destination\n");
+		return 0;
+	}
+
+	cidnum  = rep_quotation(chan->caller.id.number.str);
+	cidname = rep_quotation(chan->caller.id.name.str);
+
+        if (!strncmp(dst, "000000", 6)) {
+                SIPAddHeader(chan, "Privacy: id");
+                ast_copy_string(chan->exten, &dst[6], sizeof(chan->exten));
+		if (option_debug)
+	                ast_log(LOG_DEBUG, "Call with client privacy ID\n");
+        } 
+
+	if (option_verbose >= 3)
+		ast_verbose(VERBOSE_PREFIX_3 "[%s|%s] Accountcode %s cidnum %s to dst %s\n", chan->cdr->clisrc, chan->cdr->clidst, chan->accountcode, cidnum, dst);
+
+	const char *pbackup         = NULL;
+	const char *pprovidertariff = NULL;
+	char vbackup[] = "0";
+	const char *CliBilling = NULL;
+
+	ast_channel_lock(chan);
+	pbackup         = pbx_builtin_getvar_helper(chan, "ZSBILLING_BACKUP"        );
+	pprovidertariff = pbx_builtin_getvar_helper(chan, "ZSBILLING_PROVIDERTARIFF");
+	CliBilling      = pbx_builtin_getvar_helper(chan, "CLIBILLING"              );
+	faxuid          = pbx_builtin_getvar_helper(chan, "FAXUID"                  );
+	ast_channel_unlock(chan);
+
+	if (pbackup) {
+		pbackup = ast_strdupa(pbackup);
+		ast_copy_string(vbackup, pbackup, sizeof(vbackup));
+	}
+
+	if (pprovidertariff)
+		pprovidertariff = ast_strdupa(pprovidertariff);
+
+	char tucall_Root[AST_MAX_EXTENSION*2];
+	char tucall_Accountcode[AST_MAX_EXTENSION*2];
+	char tucall_Context[AST_MAX_EXTENSION*2];
+	char tucall_Name[AST_MAX_EXTENSION*2];
+	char tucall_Num[AST_MAX_EXTENSION*2];
+	char tucall_Backup[AST_MAX_EXTENSION*2];
+	char tucall_Provider[AST_MAX_EXTENSION*2];
+	char tucall_CliBilling[AST_MAX_EXTENSION*2];
+
+	if (CliBilling)
+		sprintf(tucall_CliBilling, "tucall_CliBilling: %s", CliBilling);
+
+	sprintf(tucall_Root       , "tucall_Root: %i"       , *ast_config_AST_SYSTEM_ROOT);
+	sprintf(tucall_Accountcode, "tucall_Accountcode: %s", chan->accountcode          );
+	sprintf(tucall_Context    , "tucall_Context: %s"    , chan->context              );
+	sprintf(tucall_Name       , "tucall_Name: %s"       , cidname                    );
+	sprintf(tucall_Num        , "tucall_Num: %s"        , cidnum                     );
+	if (cidnum)
+		free(cidnum);
+	sprintf(tucall_Backup     , "tucall_Backup: %s"     , vbackup);
+
+	SIPRemoveHeader(chan, NULL);
+
+	if (pprovidertariff) {
+		sprintf(tucall_Provider, "tucall_Provider: %s", pprovidertariff);
+		SIPAddHeader(chan, tucall_Provider);
+	}
+
+	SIPAddHeader(chan, tucall_Root       );
+	SIPAddHeader(chan, tucall_Accountcode);
+        SIPAddHeader(chan, tucall_Context    );
+        SIPAddHeader(chan, tucall_Name       );
+	SIPAddHeader(chan, tucall_Num        );
+        SIPAddHeader(chan, tucall_Backup     );
+	
+	if (CliBilling)
+		SIPAddHeader(chan, tucall_CliBilling);
+
+	sprintf(tech, "SIP/9999#%s@%s", dst, proxyname);
+
+	const char codec[32];
+
+	ast_channel_lock(chan);
+	ast_copy_string((char*)codec, ast_getformatname(chan->readformat), sizeof(codec));
+	ast_channel_unlock(chan);
+
+	//if (!strcmp(codec, "slin"))
+	ast_copy_string((char*)codec, "alaw", sizeof(codec));
+
+	ast_channel_lock(chan);
+	pbx_builtin_setvar_helper(chan, "_SIP_CODEC_INHERITED", codec);
+	ast_channel_unlock(chan);
+
+	if (option_verbose >= 3)
+		ast_verbose(VERBOSE_PREFIX_3 "[%s|%s] Codec inherited: %s\n", chan->cdr->clisrc, chan->cdr->clidst, codec);
+
+	dial(chan, tech);
+
+	if ((faxuid) && (atoi(vbackup) == 0)) {
+		const char *dialstatus = NULL;
+
+		ast_channel_lock(chan);
+		dialstatus = pbx_builtin_getvar_helper(chan, "DIALSTATUS");
+		ast_channel_unlock(chan);
+
+		if (dialstatus) {
+			if (strcasecmp(dialstatus, "ANSWER") == 0)
+				return 0;
+			else if (strcasecmp(dialstatus, "BUSY") == 0)
+				ast_update_realtime("faxsnd", "id", faxuid, "status", "COMUNICA", NULL);
+			else if ((strcasecmp(dialstatus, "NOANSWER") == 0) || (strcasecmp(dialstatus, "CONGESTION") == 0))
+				ast_update_realtime("faxsnd", "id", faxuid, "status", "NO CONTESTA", NULL);
+			else if (strcasecmp(dialstatus, "CHANUNAVAIL") == 0)
+				ast_update_realtime("faxsnd", "id", faxuid, "status", "NO EXISTE", NULL);
+			else
+				ast_update_realtime("faxsnd", "id", faxuid, "status", dialstatus, NULL);
+		}
+		char cmd[1024];
+		sprintf(cmd, "/usr/bin/nice -n 19 /home/tucall/pbx/utils/emails/sendfaxok.py %s &", faxuid);
+		if (option_verbose > 5)
+			ast_verbose(VERBOSE_PREFIX_3 "%s\n", cmd);
+		system(cmd);
+		return 1;
+	}
+
+        return 0;
+}
+
+static int unload_module(void)
+{
+	int res;
+
+	res = ast_unregister_application(app);
+
+        return res; 
+}
+
+static int load_module(void)
+{
+        struct ast_config *cfg = NULL;
+	struct ast_flags config_flags = { 0, };
+        struct ast_variable *var = NULL;
+        const char *tmp=NULL;
+
+        cfg = ast_config_load("gabilling.conf", config_flags);
+        if (!cfg) {
+                ast_log(LOG_WARNING, "Unable to load config for GAB Billing Application: gabilling.conf\n" );
+                return 0;
+        }
+
+        var = ast_variable_browse(cfg, "global");
+        if (!var) {
+                return 0;
+        }
+
+        if ((tmp = ast_variable_retrieve(cfg, "global", "hostnamealaw"))) {
+		strcpy(proxyname, tmp);
+	} 
+
+        ast_config_destroy(cfg);
+
+	if (option_debug) {
+	        ast_log(LOG_DEBUG,"got hostname of %s\n",proxyname);
+	}
+
+	dial_app            = pbx_findapp("Dial"           );
+	hangup_app          = pbx_findapp("Hangup"         );
+	sipaddheader_app    = pbx_findapp("SipAddHeader"   );
+	sipremoveheader_app = pbx_findapp("SipRemoveHeader");
+	set_app             = pbx_findapp("Set"            );
+        
+	return ast_register_application_xml(app, gabilling_exec);;
+}
+
+AST_MODULE_INFO(GABPBX_GPL_KEY, AST_MODFLAG_DEFAULT, "GAB Billing Application alaw",
+                .load = load_module,
+                .unload = unload_module,
+               );
+
